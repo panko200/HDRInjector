@@ -1,0 +1,110 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64;AnyCPU</Platforms>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\'))</RepoRoot>
+    <PathMap>$(RepoRoot)=.</PathMap>
+
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+    <!-- Used only for ABI-accurate AVCodecContext field offsets while wiring the native D3D11VA probe. -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="YukkuriMovieMaker">
+      <HintPath>$(YMM4DirPath)YukkuriMovieMaker.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="YukkuriMovieMaker.Plugin">
+      <HintPath>$(YMM4DirPath)YukkuriMovieMaker.Plugin.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="YukkuriMovieMaker.Controls">
+      <HintPath>$(YMM4DirPath)YukkuriMovieMaker.Controls.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Vortice.Direct2D1">
+      <HintPath>$(YMM4DirPath)Vortice.Direct2D1.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Vortice.Direct3D11">
+      <HintPath>$(YMM4DirPath)Vortice.Direct3D11.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Vortice.DirectX">
+      <HintPath>$(YMM4DirPath)Vortice.DirectX.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Vortice.DXGI">
+      <HintPath>$(YMM4DirPath)Vortice.DXGI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Vortice.Mathematics">
+      <HintPath>$(YMM4DirPath)Vortice.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpGen.Runtime">
+      <HintPath>$(YMM4DirPath)SharpGen.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpGen.Runtime.COM">
+      <HintPath>$(YMM4DirPath)SharpGen.Runtime.COM.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MathNet.Numerics">
+      <HintPath>$(YMM4DirPath)MathNet.Numerics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Shaders\HdrGlowShader.cso" />
+    <None Remove="Shaders\HdrColorConvertShader.cso" />
+    <None Remove="Shaders\SrgbToLinearShader.cso" />
+    <None Remove="Shaders\HdrToneMappingShader.cso" />
+    <None Remove="Shaders\HdrExportColorConvertCS.cso" />
+    <None Remove="Shaders\HdrP010ProbeCS.cso" />
+    <None Remove="Shaders\HdrP010ToRgbCS.cso" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\HdrP010ToRgbCS.hlsl" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\HdrGlowShader.cso" />
+    <EmbeddedResource Include="Shaders\HdrColorConvertShader.cso" />
+    <EmbeddedResource Include="Shaders\SrgbToLinearShader.cso" />
+    <EmbeddedResource Include="Shaders\HdrToneMappingShader.cso" />
+    <EmbeddedResource Include="Shaders\HdrExportColorConvertCS.cso" />
+    <EmbeddedResource Include="Shaders\HdrP010ProbeCS.cso" />
+    <EmbeddedResource Include="Shaders\HdrP010ToRgbCS.cso" />
+  </ItemGroup>
+
+  <Target Name="ShaderBuild" BeforeTargets="BeforeBuild">
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T ps_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrGlowShader.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrGlowShader.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T ps_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrColorConvertShader.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrColorConvertShader.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T ps_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\SrgbToLinearShader.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\SrgbToLinearShader.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T ps_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrToneMappingShader.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrToneMappingShader.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T cs_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrExportColorConvertCS.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrExportColorConvertCS.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T cs_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrP010ProbeCS.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrP010ProbeCS.hlsl&quot;" />
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe&quot; /T cs_5_0 /E main /Fo &quot;$(MSBuildProjectDirectory)\Shaders\HdrP010ToRgbCS.cso&quot; &quot;$(MSBuildProjectDirectory)\Shaders\HdrP010ToRgbCS.hlsl&quot;" />
+  </Target>
+
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Exec Command="if not exist &quot;$(YMM4DirPath)user\plugin\$(ProjectName)&quot; mkdir &quot;$(YMM4DirPath)user\plugin\$(ProjectName)&quot;" />
+    <Exec Command="copy /Y &quot;$(TargetDir)*.dll&quot; &quot;$(YMM4DirPath)user\plugin\$(ProjectName)\&quot; &gt; NUL" />
+  </Target>
+
+</Project>
