@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Reflection;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Plugin.FileSource;
 
@@ -98,7 +100,46 @@ public class HdrVideoFileSourcePlugin : IVideoFileSourcePlugin
 
     private static string? FindFfprobe()
     {
-        // YMM4 付属の FFprobe を探す
+        // YMM4 自身が使用している FFmpegResourceLocator を最優先する。
+        // 兄弟PCなどで PATH に ffprobe が登録されていなくても、YMM4 付属FFmpegを確実に使える。
+        try
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => string.Equals(
+                    a.GetName().Name,
+                    "YukkuriMovieMaker.Plugin.FileSource.FFmpeg",
+                    StringComparison.OrdinalIgnoreCase));
+
+            assembly ??= Assembly.Load("YukkuriMovieMaker.Plugin.FileSource.FFmpeg");
+
+            var locator = assembly.GetType(
+                "YukkuriMovieMaker.Plugin.FileSource.FFmpeg.FFmpegResourceLocator",
+                throwOnError: false);
+            var method = locator?.GetMethod(
+                "GetFFmpegExePath",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (method != null && method.GetParameters().Length == 0
+                && method.Invoke(null, null) is string ffmpegPath
+                && File.Exists(ffmpegPath))
+            {
+                string ffprobePath = Path.Combine(
+                    Path.GetDirectoryName(ffmpegPath)!,
+                    "ffprobe.exe");
+                if (File.Exists(ffprobePath))
+                    return ffprobePath;
+
+                Debug.WriteLine(
+                    $"[HDRInjector][HdrPlugin] FFmpegResourceLocator found ffmpeg but ffprobe was missing: {ffprobePath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(
+                $"[HDRInjector][HdrPlugin] FFmpegResourceLocator lookup failed: {ex.Message}");
+        }
+
+        // フォールバック: プラグイン/アプリケーション配下。
         string appDir = AppDomain.CurrentDomain.BaseDirectory;
         string[] candidates = new[]
         {
@@ -112,7 +153,7 @@ public class HdrVideoFileSourcePlugin : IVideoFileSourcePlugin
             if (File.Exists(path)) return path;
         }
 
-        // PATH から探す
+        // 最終フォールバック: PATH。
         try
         {
             var startInfo = new ProcessStartInfo
@@ -131,7 +172,10 @@ public class HdrVideoFileSourcePlugin : IVideoFileSourcePlugin
                 if (process.ExitCode == 0) return "ffprobe";
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[HDRInjector][HdrPlugin] PATH ffprobe lookup failed: {ex.Message}");
+        }
 
         return null;
     }

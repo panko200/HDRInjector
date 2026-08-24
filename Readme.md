@@ -58,6 +58,18 @@ _免責事項: 作者は、本プラグインの使用または使用不能に�
 ## アップデート内容
 
 v0.1.0  
+まともに動くようになった
+
+v0.1.1  
+ffprobe修正
+
+v0.1.2  
+ffprobe探索修正
+
+v0.1.3  
+Radeon対応(Arcは対応しておりません。)
+
+v1.0.0  
 初公開
 
 ## ライセンス
@@ -95,3 +107,14 @@ Harmony (Lib.Harmony)
 - https://github.com/pardeike/Harmony
 
 [Harmony License](./Harmony_LICENSE)
+
+### ColorPicker_plus
+
+本プラグインは、以下のYMM4プラグインを参考に制作されました。プラグインの開発者に感謝申し上げます。
+
+**ColorPicker_plus**
+
+- License: MIT License
+- Author: leftcontroller0518
+- URL: [https://github.com/leftcontroller0518/colorpicker_plus](https://github.com/leftcontroller0518/colorpicker_plus)
+- [MIT License](./ColorPicker_plus_LICENSE)

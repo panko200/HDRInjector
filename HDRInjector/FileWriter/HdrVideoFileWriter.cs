@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -29,6 +30,8 @@ namespace HDRInjector.FileWriter;
 /// </summary>
 public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, IVideoFileWriter, IDisposable
 {
+    private static readonly List<string> LastEncoderProbeFailures = new();
+
     private readonly string outputPath;
     private readonly VideoInfo videoInfo;
     private readonly HdrVideoWriterSettings settings;
@@ -74,6 +77,7 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
     private int lastHeight;
     private bool started;
     private bool disposed;
+    private string selectedVideoEncoder = string.Empty;
 
     // HDR10 Content Light Level Information (SEI), measured while converting frames.
     private float maxContentLightLevelNits;
@@ -157,16 +161,23 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
         string fps = Math.Max(1, videoInfo.FPS).ToString();
 
         // Video process: receive planar 10-bit YUV and encode HEVC Main10.
+        // Prefer NVIDIA NVENC when available, otherwise use AMD AMF. This keeps HDR
+        // output working on both NVIDIA and AMD systems while continuing to use the
+        // same bundled YMM4 FFmpeg executable.
+        var encoder = SelectHevcEncoder(ffmpeg, settings.Qp, videoInfo.Width, videoInfo.Height, videoInfo.FPS, out var encoderArgs);
+        selectedVideoEncoder = encoder;
         string videoArgs =
             $"-y -f rawvideo -pix_fmt yuv420p10le -s {size} -r {fps} -i - " +
-            "-c:v hevc_nvenc -profile:v main10 -preset " + settings.NvencPreset + " -rc constqp -qp " + settings.Qp + " -pix_fmt p010le " +
+            encoderArgs +
+            " -pix_fmt p010le " +
             "-color_range tv -colorspace bt2020nc -color_primaries bt2020 -color_trc smpte2084 " +
-            // Force the HEVC SPS/VUI color description in the elementary stream.
-            // The bundled NVENC build does not expose the hdr10/master_display/max_cll
-            // encoder options, so HDR10 static SEI is injected by our own post-process.
-            "-bsf:v hevc_metadata=video_full_range_flag=0:colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9 " +
+            // Do not run hevc_metadata inline. Some hardware encoders (notably AMF)
+            // do not expose VPS/SPS extradata to the bitstream filter until after the
+            // first encoded access unit, so the inline filter can fail before frame 0.
+            // We apply the same VUI rewrite as a separate post-encode pass below.
             $"-an -f hevc \"{videoTempPath}\"";
 
+        Debug.WriteLine($"[HDRInjector][HDRWriter] HEVC encoder selected: {encoder}");
         Debug.WriteLine($"[HDRInjector][HDRWriter] Video args: {videoArgs}");
         Debug.WriteLine("[HDRInjector][HDRWriter] Raw HEVC output enabled: VUI signaling + post-encode HDR10 SEI injection");
         videoProcess = StartProcess(ffmpeg, videoArgs, line => videoError += line + Environment.NewLine, out videoStream);
@@ -185,6 +196,217 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
 
         Debug.WriteLine("[HDRInjector][HDRWriter] HDR10 writer started: yuv420p10le input -> HEVC Main10 raw stream + BT.2020/PQ");
         Debug.WriteLine("[HDRInjector][HDRWriter] HEVC VUI: range=limited, primaries=9(bt2020), transfer=16(smpte2084), matrix=9(bt2020nc)");
+    }
+
+
+    private static string SelectHevcEncoder(string ffmpeg, int qp, int width, int height, int fps, out string encoderArgs)
+    {
+        lock (LastEncoderProbeFailures)
+            LastEncoderProbeFailures.Clear();
+
+        string available = GetAvailableHevcEncoders(ffmpeg);
+        Debug.WriteLine($"[HDRInjector][HDRWriter] Available HEVC encoders: {available}");
+        Debug.WriteLine($"[HDRInjector][HDRWriter] Encoder probe source: {width}x{height}@{fps}fps, QP={qp}");
+
+        var candidates = new[]
+        {
+            (name: "hevc_nvenc", args: $"-c:v hevc_nvenc -profile:v main10 -preset p5 -rc constqp -qp {qp}"),
+            (name: "hevc_amf", args: $"-c:v hevc_amf -profile:v main10 -quality balanced -rc cqp -qp_i {qp} -qp_p {qp}"),
+            // Software fallback when available.
+            (name: "libx265", args: $"-c:v libx265 -preset medium -qp {qp}")
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (!EncoderListed(available, candidate.name))
+                continue;
+
+            if (ProbeHevcEncoder(ffmpeg, candidate.name, candidate.args, width, height, fps))
+            {
+                encoderArgs = candidate.args;
+                return candidate.name;
+            }
+        }
+
+        encoderArgs = string.Empty;
+        string probeDetails;
+        lock (LastEncoderProbeFailures)
+            probeDetails = LastEncoderProbeFailures.Count == 0
+                ? "(probe details unavailable)"
+                : string.Join(" | ", LastEncoderProbeFailures);
+
+        throw new InvalidOperationException(
+            "HDR動画出力に使用できるHEVCエンコーダーが見つかりませんでした。\n" +
+            $"YMM4付属FFmpegのHEVCエンコーダー: {available}\n" +
+            $"エンコーダープローブ結果: {probeDetails}\n" +
+            "NVIDIA: NVENC / AMD: AMF / ソフトウェア: libx265 のいずれかが必要です。");
+    }
+
+    private static string GetAvailableHevcEncoders(string ffmpeg)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = "-hide_banner -encoders",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null)
+                return "(FFmpeg process start failed)";
+
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(5000);
+
+            var names = new List<string>();
+            foreach (var line in (stdout + Environment.NewLine + stderr).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var trimmed = line.Trim();
+                if (!trimmed.Contains("hevc_", StringComparison.OrdinalIgnoreCase) &&
+                    !trimmed.Contains("libx265", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Typical ffmpeg output: " V..... hevc_nvenc NVIDIA NVENC hevc encoder"
+                var parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var part in parts)
+                {
+                    if (part.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
+                        part.Equals("hevc_amf", StringComparison.OrdinalIgnoreCase) ||
+                        part.Equals("libx265", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!names.Exists(x => string.Equals(x, part, StringComparison.OrdinalIgnoreCase)))
+                            names.Add(part);
+                    }
+                }
+            }
+
+            return names.Count > 0 ? string.Join(", ", names) : "(none detected)";
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[HDRInjector][HDRWriter] FFmpeg encoder enumeration failed: {ex.Message}");
+            return "(enumeration failed)";
+        }
+    }
+
+    private static bool EncoderListed(string available, string encoder)
+    {
+        return available.Contains(encoder, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ProbeHevcEncoder(string ffmpeg, string encoder, string encoderArgs, int width, int height, int fps)
+    {
+        if (string.Equals(encoder, "hevc_amf", StringComparison.OrdinalIgnoreCase))
+        {
+            // One build, multiple AMF probes. The important point is to use the actual
+            // YMM4 output dimensions instead of a tiny 64x64 synthetic frame: AMF may
+            // reject out-of-range dimensions even though the real 4K target is valid.
+            var qp = ExtractQp(encoderArgs);
+            var probes = new[]
+            {
+                (label: "AMF-P010-Main10-minimal", args: $"-c:v hevc_amf -profile:v main10"),
+                (label: "AMF-P010-Main10-quality", args: $"-c:v hevc_amf -profile:v main10 -quality balanced"),
+                (label: "AMF-P010-Main10-CQP", args: $"-c:v hevc_amf -profile:v main10 -quality balanced -rc cqp -qp_i {qp} -qp_p {qp}"),
+                (label: "AMF-P010-Main10-CQP-HDR", args: $"-c:v hevc_amf -profile:v main10 -quality balanced -rc cqp -qp_i {qp} -qp_p {qp} -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc")
+            };
+
+            bool anySuccess = false;
+            lock (LastEncoderProbeFailures)
+                LastEncoderProbeFailures.Add($"AMF probe target: {width}x{height}@{fps}fps, input=p010le");
+
+            foreach (var probe in probes)
+            {
+                var result = RunEncoderProbe(ffmpeg, probe.label, probe.args, width, height, fps);
+                if (result.ok)
+                {
+                    anySuccess = true;
+                    Debug.WriteLine($"[HDRInjector][HDRWriter][AMF] {probe.label}: SUCCESS");
+                    // Return the real production args that include QP; if the minimal or
+                    // quality-only probe was the first successful one, keep probing so the
+                    // full CQP/HDR condition can still be reported in one build.
+                }
+                else
+                {
+                    Debug.WriteLine($"[HDRInjector][HDRWriter][AMF] {probe.label}: FAIL {result.detail}");
+                    lock (LastEncoderProbeFailures)
+                        LastEncoderProbeFailures.Add($"{probe.label}: {result.detail}");
+                }
+            }
+
+            // The production configuration is the CQP variant if it succeeds.
+            var productionProbe = RunEncoderProbe(
+                ffmpeg,
+                "AMF-PRODUCTION-RECHECK",
+                $"-c:v hevc_amf -profile:v main10 -quality balanced -rc cqp -qp_i {qp} -qp_p {qp}",
+                width,
+                height,
+                fps);
+
+            if (productionProbe.ok)
+            {
+                Debug.WriteLine("[HDRInjector][HDRWriter][AMF] AMF-PRODUCTION-RECHECK: SUCCESS");
+                return true;
+            }
+
+            lock (LastEncoderProbeFailures)
+                LastEncoderProbeFailures.Add($"AMF-PRODUCTION-RECHECK: {productionProbe.detail}");
+
+            // Return failure here so the caller can continue to other available encoders.
+            // The detailed probe log above is retained for the final exception.
+            return false;
+        }
+
+        return RunEncoderProbe(ffmpeg, encoder, encoderArgs, width, height, fps).ok;
+    }
+
+    private static int ExtractQp(string args)
+    {
+        var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            if (parts[i] == "-qp_i" && int.TryParse(parts[i + 1], out var qp))
+                return qp;
+        }
+        return 20;
+    }
+
+    private static (bool ok, string detail) RunEncoderProbe(string ffmpeg, string label, string encoderArgs, int width, int height, int fps)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = $"-hide_banner -loglevel error -f lavfi -i " +
+                            $"nullsrc=s={Math.Max(2, width)}x{Math.Max(2, height)}:r={Math.Max(1, fps)},format=p010le " +
+                            $"-frames:v 1 -pix_fmt p010le {encoderArgs} -f null -",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null)
+                return (false, "process start failed");
+
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(10000);
+            bool ok = process.HasExited && process.ExitCode == 0;
+            string detail = string.IsNullOrWhiteSpace(stderr) ? $"exit={(process.HasExited ? process.ExitCode.ToString() : "timeout")}" : stderr.Trim();
+            Debug.WriteLine($"[HDRInjector][HDRWriter][Probe] {label}: ok={ok}, exit={(process.HasExited ? process.ExitCode.ToString() : "timeout")}, detail={detail}");
+            return (ok, detail);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"exception={ex.Message}");
+        }
     }
 
     private static Process? StartProcess(string fileName, string arguments, Action<string>? errorHandler, out Stream? stdin)
@@ -743,15 +965,78 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
         try { videoProcess?.WaitForExit(15_000); } catch { }
         try { audioProcess?.WaitForExit(15_000); } catch { }
 
+        // IMPORTANT: The real encoder process can fail after the startup probe succeeds.
+        // Check its exit code and stderr BEFORE attempting HDR10 SEI injection, otherwise
+        // an empty/broken HEVC temp file produces a misleading "HEVC stream is empty" error.
+        if (videoProcess == null)
+            throw new InvalidOperationException("HDR動画のHEVCエンコーダープロセスが開始されていません。");
+
+        if (!videoProcess.HasExited)
+        {
+            throw new InvalidOperationException(
+                "HDR動画のHEVCエンコーダーが終了しませんでした（15秒タイムアウト）。" +
+                Environment.NewLine + videoError);
+        }
+
+        if (videoProcess.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"HDR動画のHEVCエンコードに失敗しました。exitCode={videoProcess.ExitCode}" +
+                Environment.NewLine + videoError);
+        }
+
+        if (!File.Exists(videoTempPath))
+        {
+            throw new InvalidOperationException(
+                "HDR動画のHEVC一時ファイルが生成されませんでした。" +
+                Environment.NewLine + videoError);
+        }
+
+        var videoTempLength = new FileInfo(videoTempPath).Length;
+        if (videoTempLength <= 0)
+        {
+            throw new InvalidOperationException(
+                $"HDR動画のHEVC一時ファイルが空です。size={videoTempLength} bytes" +
+                Environment.NewLine + videoError);
+        }
+
+        if (audioProcess != null && audioProcess.HasExited && audioProcess.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"HDR動画の音声エンコードに失敗しました。exitCode={audioProcess.ExitCode}" +
+                Environment.NewLine + audioError);
+        }
+
         try
         {
             string ffmpeg = FindFfmpeg();
 
-            // The bundled FFmpeg/NVENC build does not expose HDR10 SEI encoder options.
-            // Inject the static HDR10 metadata directly into the raw HEVC stream before muxing.
+            // Apply HEVC VUI color metadata AFTER encoding. This is intentionally a
+            // separate pass: AMF may not provide VPS/SPS extradata early enough for
+            // hevc_metadata to initialize when it is placed inline on the encoder.
+            string vuiVideoTempPath = videoTempPath + ".vui.hevc";
+            string vuiError = "[HDRInjector][HDRWriter] HEVC VUI post-process error: ";
+            string vuiArgs =
+                $"-y -hide_banner -f hevc -i \"{videoTempPath}\" -c:v copy " +
+                "-bsf:v hevc_metadata=video_full_range_flag=0:colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9 " +
+                $"-f hevc \"{vuiVideoTempPath}\"";
+            Debug.WriteLine($"[HDRInjector][HDRWriter] Post-encode HEVC VUI pass: encoder={selectedVideoEncoder}");
+            using (var vuiProcess = StartProcessWithoutInput(ffmpeg, vuiArgs, line => vuiError += line + Environment.NewLine))
+            {
+                if (vuiProcess == null)
+                    throw new InvalidOperationException("HEVC VUI後処理用FFmpegを起動できませんでした。" + Environment.NewLine + vuiError);
+                vuiProcess.WaitForExit();
+                if (vuiProcess.ExitCode != 0)
+                    throw new InvalidOperationException($"HEVC VUI後処理に失敗しました。exitCode={vuiProcess.ExitCode}" + Environment.NewLine + vuiError);
+            }
+
+            if (!File.Exists(vuiVideoTempPath) || new FileInfo(vuiVideoTempPath).Length <= 0)
+                throw new InvalidOperationException("HEVC VUI後処理で有効な一時ファイルが生成されませんでした。" + Environment.NewLine + vuiError);
+
+            // Inject the HDR10 static SEI after the VUI rewrite.
             string metadataVideoTempPath = videoTempPath + ".hdr10.hevc";
             Hdr10SeiInjector.Inject(
-                videoTempPath,
+                vuiVideoTempPath,
                 metadataVideoTempPath,
                 maxContentLightLevelNits,
                 maxFrameAverageLightLevelNits,
@@ -771,6 +1056,7 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
                 throw new InvalidOperationException("HDR動画の音声・映像muxに失敗しました。" + Environment.NewLine + muxError);
             }
 
+            try { File.Delete(vuiVideoTempPath); } catch { }
             try { File.Delete(metadataVideoTempPath); } catch { }
             Debug.WriteLine($"[HDRInjector][HDRWriter] HDR10 metadata applied: MaxCLL={maxContentLightLevelNits:0.##} nits, MaxFALL={maxFrameAverageLightLevelNits:0.##} nits");
             Debug.WriteLine($"[HDRInjector][HDRWriter] Output completed: {outputPath}");
@@ -802,6 +1088,7 @@ public sealed class HdrVideoFileWriter : IVideoFileWriter3, IVideoFileWriter2, I
             try { gpuConverter?.Dispose(); } catch { }
         try { staging?.Dispose(); } catch { }
             try { if (File.Exists(videoTempPath)) File.Delete(videoTempPath); } catch { }
+            try { if (File.Exists(videoTempPath + ".vui.hevc")) File.Delete(videoTempPath + ".vui.hevc"); } catch { }
             try { if (File.Exists(videoTempPath + ".hdr10.hevc")) File.Delete(videoTempPath + ".hdr10.hevc"); } catch { }
             try { if (File.Exists(audioTempPath)) File.Delete(audioTempPath); } catch { }
         }

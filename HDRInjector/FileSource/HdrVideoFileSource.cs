@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Threading;
@@ -191,13 +193,19 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
     {
         try
         {
-            string ffprobePath = FindFfprobe();
-            if (ffprobePath == null) return;
+            string? ffprobePath = FindFfprobe();
+            if (string.IsNullOrWhiteSpace(ffprobePath))
+            {
+                Debug.WriteLine("[HDRInjector][HDR] ProbeVideoInfo: ffprobe not found.");
+                return;
+            }
 
             var startInfo = new ProcessStartInfo
             {
                 FileName = ffprobePath,
-                Arguments = $"-v quiet -print_format json -show_streams -show_format \"{filePath}\"",
+                // Probe only the first video stream so duration/frame-rate values are not
+                // accidentally taken from an audio/data stream.
+                Arguments = $"-v quiet -print_format json -select_streams v:0 -show_entries stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration:format=duration \"{filePath}\"",
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -215,17 +223,16 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
             int h = ExtractJsonInt(json, "\"height\"");
             if (h > 0) height = h;
 
-            double r = ExtractJsonDouble(json, "\"r_frame_rate\"");
+            double r = ExtractJsonRate(json, "\"r_frame_rate\"");
+            if (r <= 0) r = ExtractJsonRate(json, "\"avg_frame_rate\"");
             if (r > 0) fps = r;
 
             int nbFrames = ExtractJsonInt(json, "\"nb_frames\"");
-            if (nbFrames > 0 && fps > 0)
+            double dur = ExtractJsonDouble(json, "\"duration\"");
+            if (dur > 0)
+                duration = TimeSpan.FromSeconds(dur);
+            else if (nbFrames > 0 && fps > 0)
                 duration = TimeSpan.FromSeconds(nbFrames / fps);
-            else
-            {
-                double dur = ExtractJsonDouble(json, "\"duration\"");
-                if (dur > 0) duration = TimeSpan.FromSeconds(dur);
-            }
 
             bytesPerPixel = 8;
 
@@ -955,8 +962,46 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
 
     private static string? FindFfprobe()
     {
+        // Use the exact FFmpeg bundle selected by YMM4. This is especially important on
+        // machines where ffprobe.exe is not on PATH (for example a second PC).
+        try
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => string.Equals(
+                    a.GetName().Name,
+                    "YukkuriMovieMaker.Plugin.FileSource.FFmpeg",
+                    StringComparison.OrdinalIgnoreCase));
+
+            assembly ??= Assembly.Load("YukkuriMovieMaker.Plugin.FileSource.FFmpeg");
+
+            var locator = assembly.GetType(
+                "YukkuriMovieMaker.Plugin.FileSource.FFmpeg.FFmpegResourceLocator",
+                throwOnError: false);
+            var method = locator?.GetMethod(
+                "GetFFmpegExePath",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (method != null && method.GetParameters().Length == 0
+                && method.Invoke(null, null) is string ffmpegPath
+                && File.Exists(ffmpegPath))
+            {
+                string ffprobePath = Path.Combine(
+                    Path.GetDirectoryName(ffmpegPath)!,
+                    "ffprobe.exe");
+                if (File.Exists(ffprobePath))
+                    return ffprobePath;
+
+                Debug.WriteLine(
+                    $"[HDRInjector][HDR] FFmpegResourceLocator found ffmpeg but ffprobe was missing: {ffprobePath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[HDRInjector][HDR] FFprobe locator lookup failed: {ex.Message}");
+        }
+
         string appDir = AppDomain.CurrentDomain.BaseDirectory;
-        string[] candidates = new[]
+        string[] candidates =
         {
             Path.Combine(appDir, "ffprobe.exe"),
             Path.Combine(appDir, "ffmpeg", "ffprobe.exe"),
@@ -968,6 +1013,8 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
             if (File.Exists(path)) return path;
         }
 
+        // Last resort. Avoid assuming PATH is configured; Process.Start will fail cleanly
+        // and ProbeVideoInfo will leave the defaults intact if no executable exists.
         return "ffprobe";
     }
 
@@ -982,6 +1029,32 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
         if (idx > start && int.TryParse(json[start..idx], out int val))
             return val;
         return -1;
+    }
+
+    private static double ExtractJsonRate(string json, string key)
+    {
+        int idx = json.IndexOf(key, StringComparison.Ordinal);
+        if (idx < 0) return -1;
+        idx = json.IndexOf(':', idx) + 1;
+        while (idx < json.Length && (json[idx] == ' ' || json[idx] == '"')) idx++;
+        int start = idx;
+        while (idx < json.Length && (char.IsDigit(json[idx]) || json[idx] == '/' || json[idx] == '.')) idx++;
+        if (idx <= start) return -1;
+
+        string token = json[start..idx];
+        int slash = token.IndexOf('/');
+        if (slash > 0)
+        {
+            if (double.TryParse(token[..slash], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double num) &&
+                double.TryParse(token[(slash + 1)..], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double den) &&
+                Math.Abs(den) > double.Epsilon)
+                return num / den;
+            return -1;
+        }
+
+        return double.TryParse(token, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double value)
+            ? value
+            : -1;
     }
 
     private static double ExtractJsonDouble(string json, string key)

@@ -168,7 +168,7 @@ public sealed class HdrVideoWriterSettings : SettingsBase<HdrVideoWriterSettings
         AddLabeled(panel, "画質プリセット", qualityPreset);
         panel.Children.Add(presetDescription);
 
-        AddLabeled(panel, "NVENC プリセット", nvencPreset);
+        AddLabeled(panel, "ハードウェアエンコーダー品質", nvencPreset);
         AddLabeled(panel, "画質 (QP / CQ)", qp);
 
         var qpGuide = new Grid { Width = 220, Margin = new Thickness(0, 0, 0, 2) };
