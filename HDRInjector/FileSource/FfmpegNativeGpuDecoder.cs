@@ -161,6 +161,7 @@ internal static class GpuLeakDiagnostics
 internal sealed class FfmpegNativeGpuDecoder : IDisposable
 {
     private static readonly object RootLock = new();
+    private static readonly object D3D11ContextLock = new();
     private static readonly List<IntPtr> RootedHandles = new();
     private static bool DllDirectorySet;
     private static AvGetFormatDelegate? RootedGetFormatDelegate;
@@ -508,9 +509,9 @@ internal sealed class FfmpegNativeGpuDecoder : IDisposable
             int lastSendRc = 0;
             int lastRecvRc = 0;
 
-            // Fix94: Increased from 64 to 256 for better seek recovery.
+            // Fix94: Increased from 64 to 512 for better seek recovery.
             // After a seek, the decoder may need many packets to reach the next keyframe.
-            while (videoFrameCount < 256)
+            while (videoFrameCount < 512)
             {
                 int readRc = readFrame(formatContext, packet);
                 lastReadRc = readRc;
@@ -575,7 +576,8 @@ internal sealed class FfmpegNativeGpuDecoder : IDisposable
                         if (pendingSeekFrame >= 0 && ptsFrame < pendingSeekFrame)
                         {
                             Debug.WriteLine($"[HDRInjector][HDRGPU][DECODE] seek-discard ptsFrame={ptsFrame} target={pendingSeekFrame}");
-                            break;
+                            // Continue receiving from decoder queue to advance to the seek target.
+                            continue;
                         }
 
                         int sourceSlice = checked((int)data1);
@@ -710,21 +712,37 @@ internal sealed class FfmpegNativeGpuDecoder : IDisposable
             _fpsForFrameIndex = fps;
             flushCodecBuffers(codecContext);
 
-            // stream_index=-1 makes av_seek_frame interpret the timestamp in
-            // AV_TIME_BASE (microseconds), avoiding assumptions about the stream time_base.
             double seekTimeSec = frameIndex / fps;
-            long timestamp = (long)Math.Round(seekTimeSec * 1_000_000.0);
             const int AVSEEK_FLAG_BACKWARD = 1;
-            int seekRc = seekFrame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
+            int seekRc = -1;
+
+            // 1. First try seeking on the specific video stream using its stream time_base
+            if (videoStreamIndex >= 0 && timeBaseNum > 0 && timeBaseDen > 0)
+            {
+                long streamTimestamp = (long)Math.Round(seekTimeSec * (double)timeBaseDen / timeBaseNum);
+                seekRc = seekFrame(formatContext, videoStreamIndex, streamTimestamp, AVSEEK_FLAG_BACKWARD);
+                if (seekRc < 0)
+                {
+                    Debug.WriteLine($"[HDRInjector][HDRGPU] Seek: av_seek_frame(stream={videoStreamIndex}) rc={seekRc}, trying fallback to -1");
+                }
+            }
+
+            // 2. Fallback: stream_index=-1 with AV_TIME_BASE (microseconds)
             if (seekRc < 0)
             {
-                Debug.WriteLine($"[HDRInjector][HDRGPU] Seek: av_seek_frame(-1) failed rc={seekRc}, t={seekTimeSec:F3}s");
+                long timestamp = (long)Math.Round(seekTimeSec * 1_000_000.0);
+                seekRc = seekFrame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
+            }
+
+            if (seekRc < 0)
+            {
+                Debug.WriteLine($"[HDRInjector][HDRGPU] Seek: av_seek_frame failed rc={seekRc}, t={seekTimeSec:F3}s");
                 return false;
             }
 
             pendingSeekFrame = frameIndex;
-            lastDecodedFrame = frameIndex - 1;
-            Debug.WriteLine($"[HDRInjector][HDRGPU] Seek to frame={frameIndex} (time={seekTimeSec:F3}s) SUCCESS; waiting for PTS target via AV_TIME_BASE seek");
+            lastDecodedFrame = -1;
+            Debug.WriteLine($"[HDRInjector][HDRGPU] Seek to frame={frameIndex} (time={seekTimeSec:F3}s) SUCCESS; pendingSeekFrame={pendingSeekFrame}");
             return true;
         }
         catch (Exception ex)
@@ -1007,60 +1025,63 @@ internal sealed class FfmpegNativeGpuDecoder : IDisposable
         var device = d3dDevice ?? throw new ObjectDisposedException(nameof(FfmpegNativeGpuDecoder));
         var context = d3dContext ?? throw new ObjectDisposedException(nameof(FfmpegNativeGpuDecoder));
 
-        if (readableP010 is null || readableWidth != width || readableHeight != height)
+        lock (D3D11ContextLock)
         {
-            if (readableP010 != null) GpuLeakDiagnostics.DisposedTexture();
-            readableP010?.Dispose();
-            var readableDesc = new Texture2DDescription
+            if (readableP010 is null || readableWidth != width || readableHeight != height)
             {
-                Width = width,
-                Height = height,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = Format.P010,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.ShaderResource,
-                CPUAccessFlags = CpuAccessFlags.None,
-                MiscFlags = ResourceOptionFlags.None,
-            };
-            readableP010 = device.CreateTexture2D(readableDesc);
-            GpuLeakDiagnostics.CreatedTexture();
-            readableWidth = width;
-            readableHeight = height;
+                if (readableP010 != null) GpuLeakDiagnostics.DisposedTexture();
+                readableP010?.Dispose();
+                var readableDesc = new Texture2DDescription
+                {
+                    Width = width,
+                    Height = height,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.P010,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.ShaderResource,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                    MiscFlags = ResourceOptionFlags.None,
+                };
+                readableP010 = device.CreateTexture2D(readableDesc);
+                GpuLeakDiagnostics.CreatedTexture();
+                readableWidth = width;
+                readableHeight = height;
+            }
+
+            context.CopySubresourceRegion(readableP010, 0, 0, 0, 0, source, sourceSlice, null);
+
+            // Fix94: Reuse pooled compute resources and D2D ring buffer.
+            EnsurePooledComputeResources(device, width, height);
+            EnsureD2DRingBuffer(device, width, height);
+            EnsureP010PipelineResources(device);
+            UpdateP010PipelineConstants(context);
+
+            // Advance ring buffer index
+            int ringSlot = d2dRingIndex;
+            d2dRingIndex = (d2dRingIndex + 1) % D2DRingSize;
+
+            var d2dOutput = d2dRingTextures[ringSlot]!;
+            var bitmap = d2dRingBitmaps[ringSlot]!;
+
+            context.CSSetShader(p010ToPipelineShader);
+            context.CSSetConstantBuffer(0, p010ColorConstants);
+            context.CSSetShaderResources(0, new[] { pooledYSrv!, pooledUvSrv! });
+            context.CSSetUnorderedAccessViews(0, new[] { pooledUav! });
+            context.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+            // Copy compute output to the D2D-facing texture in the ring buffer.
+            context.CopyResource(d2dOutput, pooledComputeOutput!);
+            // Unbind resources from the pipeline to prevent hazards.
+            context.CSSetShaderResources(0, new VorticeD3D11ShaderResourceView[] { null!, null! });
+            context.CSSetUnorderedAccessViews(0, new VorticeD3D11UnorderedAccessView[] { null! });
+            context.CSSetConstantBuffers(0, new VorticeD3D11Buffer[] { null! });
+            context.CSSetShader(null);
+            // Synchronize with D2D and other threads so the output surface is ready to read.
+            context.Flush();
+
+            return bitmap;
         }
-
-        context.CopySubresourceRegion(readableP010, 0, 0, 0, 0, source, sourceSlice, null);
-
-        // Fix94: Reuse pooled compute resources and D2D ring buffer.
-        EnsurePooledComputeResources(device, width, height);
-        EnsureD2DRingBuffer(device, width, height);
-        EnsureP010PipelineResources(device);
-        UpdateP010PipelineConstants(context);
-
-        // Advance ring buffer index
-        int ringSlot = d2dRingIndex;
-        d2dRingIndex = (d2dRingIndex + 1) % D2DRingSize;
-
-        var d2dOutput = d2dRingTextures[ringSlot]!;
-        var bitmap = d2dRingBitmaps[ringSlot]!;
-
-        context.CSSetShader(p010ToPipelineShader);
-        context.CSSetConstantBuffer(0, p010ColorConstants);
-        context.CSSetShaderResources(0, new[] { pooledYSrv!, pooledUvSrv! });
-        context.CSSetUnorderedAccessViews(0, new[] { pooledUav! });
-        context.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-        // Copy compute output to the D2D-facing texture in the ring buffer.
-        context.CopyResource(d2dOutput, pooledComputeOutput!);
-        // Unbind resources from the pipeline to prevent hazards.
-        context.CSSetShaderResources(0, new VorticeD3D11ShaderResourceView[] { null!, null! });
-        context.CSSetUnorderedAccessViews(0, new VorticeD3D11UnorderedAccessView[] { null! });
-        context.CSSetConstantBuffers(0, new VorticeD3D11Buffer[] { null! });
-        context.CSSetShader(null);
-        // Fix94: Removed context.Flush(). D2D will synchronize naturally when it
-        // reads the bitmap. Flush() was forcing a full GPU pipeline stall every frame.
-
-        return bitmap;
     }
 
     private void EnsureP010PipelineResources(VorticeD3D11Device device)

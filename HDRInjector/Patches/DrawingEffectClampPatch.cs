@@ -5,6 +5,7 @@ using SharpGen.Runtime;
 using Vortice.Direct2D1;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Player.Video.Effects;
+using HDRInjector.Settings;
 
 namespace HDRInjector.Patches;
 
@@ -47,6 +48,7 @@ internal static class DrawingEffectClampPatch
 
     private static void Postfix(DrawingEffect __instance)
     {
+        if (!HdrInjectorSettings.Default.EnableHdr) return;
         try
         {
             var type = __instance.GetType();

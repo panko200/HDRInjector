@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Reflection;
 using HarmonyLib;
 using HDRInjector.Models;
+using HDRInjector.Settings;
 using Vortice.Direct2D1;
 using Vortice.Mathematics;
 using YukkuriMovieMaker.Commons;
@@ -31,6 +32,7 @@ public static class RenderingPatches
     {
         private static void Postfix(SolidColorBrushSource __instance, TimelineItemSourceDescription desc)
         {
+            if (!HdrInjectorSettings.Default.EnableHdr) return;
             try
             {
                 if (_paramField?.GetValue(__instance) is SolidColorBrushParameter param &&
@@ -65,6 +67,7 @@ public static class RenderingPatches
 
         private static void Postfix(YukkuriMovieMaker.Player.Video.Effects.MonocolorizationEffect __instance, EffectDescription effectDescription)
         {
+            if (!HdrInjectorSettings.Default.EnableHdr) return;
             try
             {
                 if (_itemField?.GetValue(__instance) is YukkuriMovieMaker.Project.Effects.MonocolorizationEffect item &&

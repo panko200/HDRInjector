@@ -2,6 +2,7 @@ using System;
 using System.Reflection;
 using HarmonyLib;
 using YukkuriMovieMaker.Plugin;
+using HDRInjector.Settings;
 
 namespace HDRInjector;
 
@@ -21,12 +22,22 @@ public class HdrColorStudioPlugin : IPlugin
         {
             var harmony = new Harmony(HarmonyId);
             harmony.PatchAll(Assembly.GetExecutingAssembly());
-            Patches.Fp16DeviceContextPatch.Apply(harmony);
-            Patches.HdrExportRenderTargetPatch.Apply(harmony);
-            Patches.DrawingEffectClampPatch.Apply(harmony);
-            Patches.HdrVideoPluginPatch.Apply(harmony);
-            Patches.HdrPreviewPatch.Apply(harmony);
-            Patches.HdrPlayerDrawPatch.Apply(harmony);
+
+            if (HdrInjectorSettings.Default.EnableHdr)
+            {
+                Patches.Fp16DeviceContextPatch.Apply(harmony);
+                Patches.HdrExportRenderTargetPatch.Apply(harmony);
+                Patches.DrawingEffectClampPatch.Apply(harmony);
+                Patches.HdrVideoPluginPatch.Apply(harmony);
+                Patches.HdrPreviewPatch.Apply(harmony);
+                Patches.HdrPlayerDrawPatch.Apply(harmony);
+
+                System.Diagnostics.Debug.WriteLine("[HDRInjector] HDR feature is ENABLED. HDR pipeline patches applied.");
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("[HDRInjector] HDR feature is DISABLED. HDR pipeline patches were not applied.");
+            }
         }
         catch (Exception ex)
         {

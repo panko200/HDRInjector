@@ -51,6 +51,7 @@ public static class ColorPickerPatch
 
     private static void Postfix(ColorPicker __instance)
     {
+        if (!HdrInjectorSettings.Default.EnableHdr) return;
         try
         {
             HookSettings();

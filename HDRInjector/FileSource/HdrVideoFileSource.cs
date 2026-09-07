@@ -177,6 +177,19 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
                     80.0f * HDRInjector.HdrPreviewManager.CurrentSdrWhiteScale);
                 gpuDecodeActive = true;
                 Debug.WriteLine($"[HDRInjector][GPU] GPU native decoder INITIALIZED: codec={decoder}");
+
+                // Warm up the first frame immediately so that effects like "Screen Duplicate"
+                // or "Group Control" do not render a black initial frame.
+                if (nativeGpuDecoder.TryDecodeToFrame(0, out var initialBitmap, out _, out string warmUpReason) && initialBitmap != null)
+                {
+                    outputBitmap = initialBitmap;
+                    transformEffect!.SetInput(0, outputBitmap, (RawBool)true);
+                    Debug.WriteLine($"[HDRInjector][GPU] Initial frame 0 warmed up successfully.");
+                }
+                else
+                {
+                    Debug.WriteLine($"[HDRInjector][GPU] Initial frame 0 warm-up skipped/failed: {warmUpReason}");
+                }
             }
             else
             {
@@ -625,7 +638,7 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
                     int gpuNext = nativeGpuDecoder.NextFrameIndex;
                     int gpuLast = nativeGpuDecoder.LastDecodedFrame;
 
-                    if (frameIndex == gpuLast)
+                    if (gpuLast >= 0 && frameIndex == gpuLast)
                         return;
 
                     // Fix94: Smart seek logic to avoid unnecessary seeks during normal playback.
@@ -633,14 +646,13 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
                     // so small forward gaps should be handled by sequential decode, not seek.
                     int skipThreshold = Math.Max(5, (int)(fps / 4.0)); // ~15 frames at 60fps
 
-                    if (frameIndex < gpuLast)
+                    if (gpuLast >= 0 && frameIndex < gpuLast)
                     {
                         // Backward jump: must seek
                         Debug.WriteLine($"[HDRInjector][GPU][Fix94] Backward seek: want={frameIndex}, last={gpuLast}; seeking.");
                         if (!nativeGpuDecoder.SeekToFrame(frameIndex, fps))
                         {
-                            Debug.WriteLine("[HDRInjector][GPU] Native seek failed; falling back to legacy path.");
-                            DisableGpuPath("native-seek-failed", frameIndex: frameIndex);
+                            Debug.WriteLine("[HDRInjector][GPU] Native seek failed; keeping current output to avoid black frame.");
                         }
                     }
                     else if (frameIndex > gpuNext + skipThreshold)
@@ -649,8 +661,7 @@ public class HdrVideoFileSource : IVideoFileSource, IDisposable
                         Debug.WriteLine($"[HDRInjector][GPU][Fix94] Large forward jump: want={frameIndex}, next={gpuNext}, gap={frameIndex - gpuNext}; seeking.");
                         if (!nativeGpuDecoder.SeekToFrame(frameIndex, fps))
                         {
-                            Debug.WriteLine("[HDRInjector][GPU] Native seek failed; falling back to legacy path.");
-                            DisableGpuPath("native-seek-failed", frameIndex: frameIndex);
+                            Debug.WriteLine("[HDRInjector][GPU] Native seek failed; keeping current output to avoid black frame.");
                         }
                     }
                     // else: small forward gap (frameIndex is between gpuNext and gpuNext+skipThreshold).

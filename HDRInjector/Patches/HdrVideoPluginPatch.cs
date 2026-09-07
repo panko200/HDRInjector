@@ -6,6 +6,7 @@ using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Plugin;
 using YukkuriMovieMaker.Plugin.FileSource;
 using HDRInjector.FileSource;
+using HDRInjector.Settings;
 
 namespace HDRInjector.Patches;
 
@@ -52,6 +53,7 @@ internal static class HdrVideoPluginPatch
     /// </summary>
     private static void Postfix(ref IVideoFileSource? __result, IGraphicsDevices devices, string filePath)
     {
+        if (!HdrInjectorSettings.Default.EnableHdr) return;
         try
         {
             // HDR メタデータを検出

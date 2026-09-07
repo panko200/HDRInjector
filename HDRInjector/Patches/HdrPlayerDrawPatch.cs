@@ -13,6 +13,7 @@ using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Player.Video;
 using YukkuriMovieMaker.Project;
 using HDRInjector.Effects;
+using HDRInjector.Settings;
 
 namespace HDRInjector.Patches;
 
@@ -221,6 +222,7 @@ public static class HdrPlayerDrawPatch
 
     private static bool DrawPrefix(object __instance)
     {
+        if (!HdrInjectorSettings.Default.EnableHdr) return true;
         try
         {
             var devicesAndContext = DevicesAndContextField?.GetValue(__instance) as IGraphicsDevicesAndContext;
